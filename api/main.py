@@ -5,9 +5,6 @@ from typing import List, Optional
 import os
 from dotenv import load_dotenv
 from string import Template
-import motor.motor_asyncio
-from datetime import datetime
-from bson.objectid import ObjectId
 
 # These agents/tools are optional and may not be available in every environment;
 # import them safely and provide fallbacks to avoid import-time crashes.
@@ -20,40 +17,11 @@ except Exception:
     ChatGoogleGenerativeAI = None
     create_react_agent = None
 
-load_dotenv()           
-google_api_key = os.getenv('GOOGLE_API_KEY')
-tavily_api_key = os.getenv('TAVILY_API_KEY')
-mongodb_uri = os.getenv(
-    'MONGODB_URI',
-    'mongodb+srv://devroopsaha844:devroopsaha844@cluster0.5otqz.mongodb.net/'
-)
+load_dotenv()
+google_api_key = os.getenv("GOOGLE_API_KEY")
+tavily_api_key = os.getenv("TAVILY_API_KEY")
 
-client = motor.motor_asyncio.AsyncIOMotorClient(mongodb_uri)
-db = client.dwa
-assessment_collection = db.assessment
-diet_allergies_collection = db.diet_allergies
-
-
-class DietaryPreferences(BaseModel):
-    dietary_preference: List[str]
-    allergies: List[str]
-    meal_plan_type: str = "3 meals/day"
-    package: str = ""
-    day: str = "today"
-
-
-class MealPlanRequest(BaseModel):
-    package: str
-    dietary_preference: List[str]
-    allergies: List[str]
-    meal_plan_type: str = "3 meals/day"
-    day: str
-
-
-class FetchUserPreferencesResponse(BaseModel):
-    dietary_preference: List[str]
-    allergies: List[str]
-
+# ---------- Pydantic Models ----------
 
 class NutritionInfo(BaseModel):
     calories: str
@@ -97,7 +65,21 @@ class IntermittentFastingPlan(BaseModel):
     dinner: BudgetBasedMeal
 
 
-# Prompt Template
+# 🚨 NEW: full request body includes personal details + preferences
+class MealPlanRequest(BaseModel):
+    age: int
+    height: str
+    weight: str
+    gender: str
+    dietary_preference: List[str]
+    allergies: List[str]
+    meal_plan_type: str = "3 meals/day"  # "3 meals/day", "4 meals/day", "Intermittent fasting (2 meals)"
+    package: str = ""                   # goal / package name
+    day: str = "today"                  # e.g., "today", "tomorrow"
+
+
+# ---------- Prompt Template ----------
+
 prompt_template = Template(
     """
 You are a top nutritionist specializing in personalized meal planning. Based on the user's profile, create a personalized meal plan for $day that STRICTLY adheres to their dietary preferences and COMPLETELY EXCLUDES any ingredients they are allergic to. The user follows the "$meal_plan_type" pattern.
@@ -138,7 +120,8 @@ Output format must be clean and JSON-like, without extra keys. Just the meals as
 """
 )
 
-# Safely create tools/agents only if imports and keys are available
+# ---------- LLM + Tools Setup ----------
+
 if TavilySearch and ChatGoogleGenerativeAI and create_react_agent and google_api_key and tavily_api_key:
     tavily_tool = TavilySearch(
         max_results=20,
@@ -166,7 +149,7 @@ if TavilySearch and ChatGoogleGenerativeAI and create_react_agent and google_api
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-pro-preview-03-25",
         google_api_key=google_api_key,
-        temperature=0.5
+        temperature=0.5,
     )
 
     agent_3_meals = create_react_agent(llm, tools=[tavily_tool], response_format=ThreeMealPlan)
@@ -178,6 +161,9 @@ else:
     agent_3_meals = None
     agent_4_meals = None
     agent_intermittent = None
+
+
+# ---------- FastAPI App ----------
 
 app = FastAPI()
 
@@ -199,81 +185,40 @@ async def root():
     return {"message": "Nutrition Meal Plan API"}
 
 
-# Since auth is removed, this is just a simple echo/utility endpoint now
-@app.get("/v1/verify-user")
-async def verify_user(user_id: str):
-    return {"user_id": user_id}
+# ---------- Core Helper (NO DB, NO USER ID) ----------
 
-
-@app.get("/v1/fetch-diet-preferences")
-async def fetch_diet_preferences(user_id: str):
+async def generate_meal_plan_for_profile(profile: MealPlanRequest):
     """
-    Fetch the user's dietary preferences and allergies.
-    user_id is now passed directly as a string (no token).
+    Generate a meal plan directly from the input profile.
+    No database, no user_id. Everything comes from the request body.
     """
     try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id")
-
-    user_preferences = await diet_allergies_collection.find_one({"user_id": oid})
-
-    if not user_preferences:
-        raise HTTPException(
-            status_code=404,
-            detail="No dietary preferences found. Please submit your dietary preferences.",
-        )
-
-    return {
-        "dietary_preference": user_preferences.get("dietary_preference", []),
-        "allergies": user_preferences.get("allergies", []),
-    }
-
-
-async def generate_meal_plan_for_user(user_id, dietary_preference, allergies, meal_plan_type, package, day):
-    """
-    Helper function to generate a meal plan based on user preferences.
-    user_id can now be a string or ObjectId.
-    """
-    try:
-        if not isinstance(user_id, ObjectId):
-            user_id = ObjectId(user_id)
-
-        user_data = await assessment_collection.find_one(
-            {"user_id": user_id},
-            sort=[("createdAt", -1)],
-        )
-
-        if not user_data:
-            raise HTTPException(status_code=404, detail=f"User with ID {user_id} not found")
-
-        personal_details = user_data.get("personal_details", {})
-
-        prompt_data = {
-            "age": personal_details.get("age", ""),
-            "height": personal_details.get("height", ""),
-            "weight": personal_details.get("weight", ""),
-            "gender": personal_details.get("gender", ""),
-            "dietary_preference": ", ".join(dietary_preference),
-            "allergies": ", ".join(allergies),
-            "package": package,
-            "meal_plan_type": meal_plan_type,
-            "day": day,
-        }
-
         if not (agent_3_meals and agent_4_meals and agent_intermittent):
             raise HTTPException(
                 status_code=500,
-                detail="LLM agents are not properly configured (missing keys or libraries).",
+                detail="LLM agents are not properly configured (missing keys or libraries or API keys).",
             )
+
+        prompt_data = {
+            "age": profile.age,
+            "height": profile.height,
+            "weight": profile.weight,
+            "gender": profile.gender,
+            "dietary_preference": ", ".join(profile.dietary_preference),
+            "allergies": ", ".join(profile.allergies),
+            "package": profile.package,
+            "meal_plan_type": profile.meal_plan_type,
+            "day": profile.day,
+        }
 
         filled_prompt = prompt_template.substitute(**prompt_data)
         inputs = {"messages": [("user", filled_prompt)]}
 
-        if meal_plan_type.startswith("3 meals"):
+        # Choose agent based on meal_plan_type
+        if profile.meal_plan_type.startswith("3 meals"):
             result = await agent_3_meals.ainvoke(inputs)
             meal_plan = result["structured_response"]
-        elif meal_plan_type.startswith("4 meals"):
+        elif profile.meal_plan_type.startswith("4 meals"):
             result = await agent_4_meals.ainvoke(inputs)
             meal_plan = result["structured_response"]
         else:
@@ -288,121 +233,15 @@ async def generate_meal_plan_for_user(user_id, dietary_preference, allergies, me
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/v1/update-diet-preferences")
-async def update_diet_preferences(
-    preferences: DietaryPreferences,
-    user_id: str,
-):
-    """
-    Update the user's dietary preferences and allergies and generate a meal plan.
-    user_id is now passed directly as a query parameter (no auth token).
-    """
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id")
-
-    user_assessment = await assessment_collection.find_one(
-        {"user_id": oid},
-        sort=[("createdAt", -1)],
-    )
-
-    if not user_assessment:
-        return {"detail": "User assessment NOT found please submit the assessment First"}
-
-    await diet_allergies_collection.update_one(
-        {"user_id": oid},
-        {
-            "$set": {
-                "dietary_preference": preferences.dietary_preference,
-                "allergies": preferences.allergies,
-                "updated_at": datetime.utcnow(),
-            }
-        },
-        upsert=True,
-    )
-
-    meal_plan = await generate_meal_plan_for_user(
-        oid,
-        preferences.dietary_preference,
-        preferences.allergies,
-        preferences.meal_plan_type,
-        preferences.package,
-        preferences.day,
-    )
-
-    return meal_plan
-
+# ---------- Public APIs (Stateless) ----------
 
 @app.post("/v1/generate-meal-plan")
-async def generate_meal_plan(
-    request: MealPlanRequest,
-    user_id: str,
-):
+async def generate_meal_plan(request: MealPlanRequest):
     """
-    Generate a meal plan based on the user's preferences.
-    Also stores the dietary preferences and allergies in the diet_allergies collection
-    only if user assessment exists.
-    user_id is passed directly (no token).
+    Generate a meal plan based purely on the request body.
+    No auth, no user_id, no MongoDB – completely stateless.
     """
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id")
-
-    try:
-        user_assessment = await assessment_collection.find_one(
-            {"user_id": oid},
-            sort=[("createdAt", -1)],
-        )
-
-        if not user_assessment:
-            return {"detail": "User assessment NOT found please submit the assessment First"}
-
-        await diet_allergies_collection.update_one(
-            {"user_id": oid},
-            {
-                "$set": {
-                    "dietary_preference": request.dietary_preference,
-                    "allergies": request.allergies,
-                    "updated_at": datetime.utcnow(),
-                }
-            },
-            upsert=True,
-        )
-
-        meal_plan = await generate_meal_plan_for_user(
-            oid,
-            request.dietary_preference,
-            request.allergies,
-            request.meal_plan_type,
-            request.package,
-            request.day,
-        )
-
-        return meal_plan
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/v1/has-previous-preferences")
-async def has_previous_preferences(user_id: str):
-    """
-    Check if the user has previously set dietary preferences.
-    user_id is now passed directly as a query parameter.
-    """
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id")
-
-    preferences = await diet_allergies_collection.find_one({"user_id": oid})
-
-    return {"has_previous_preferences": preferences is not None}
+    return await generate_meal_plan_for_profile(request)
 
 
 @app.post("/nutrition-images")
